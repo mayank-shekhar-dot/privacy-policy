@@ -203,6 +203,8 @@ input,textarea{font:inherit;color:inherit}
 .theme-toggle{font-size:1.15rem}
 .theme-toggle.floating{position:fixed;z-index:60;top:calc(12px + env(safe-area-inset-top));right:12px;width:44px;height:44px;background:var(--glass);border:1px solid var(--glass-b);backdrop-filter:blur(14px);box-shadow:var(--shadow)}
 .theme-anim,.theme-anim *{transition:background-color .45s,color .45s,border-color .45s,box-shadow .45s!important}
+
+.head-actions{gap:2px}.head-actions .icon-btn{width:34px;height:34px;font-size:1.05rem}.avatar.me{width:34px;height:34px}
 </style>
 </head>
 <body>
@@ -249,6 +251,7 @@ input,textarea{font:inherit;color:inherit}
       </div>
     </div>
     <div class="head-actions">
+      <button class="icon-btn" id="bellBtn" type="button" aria-label="Notifications" title="Notifications"></button>
       <button class="icon-btn" id="clearBtn" type="button" aria-label="Clear chat" title="Chat clear karein">🧹</button>
       <button class="icon-btn theme-toggle" id="themeBtn" type="button" aria-label="Switch day or night theme"></button>
       <button class="avatar me" id="meBtn" aria-label="My profile" data-user=""></button>
@@ -475,7 +478,7 @@ function goLogin() {
   show('login');
 }
 $('#logoutBtn').addEventListener('click', async () => {
-  try { await api('/api/logout', { method: 'POST' }); } catch (e) { /* ignore */ }
+  try { await detachPush(); await api('/api/logout', { method: 'POST' }); } catch (e) { /* ignore */ }
   goLogin();
 });
 
@@ -492,6 +495,7 @@ function enterApp(info) {
   switchTab('chat');
   show('app');
   connectSocket();
+  updateBell(); syncPush();
 }
 
 function updateStatus() {
@@ -507,7 +511,7 @@ function updateStatus() {
 function connectSocket() {
   const s = io();
   state.socket = s;
-  s.on('connect', () => { $('#conn').classList.add('hidden'); loadMessages(true); });
+  s.on('connect', () => { $('#conn').classList.add('hidden'); s.emit('visible', { visible: !document.hidden }); loadMessages(true); });
   s.on('disconnect', () => { if (state.me) $('#conn').classList.remove('hidden'); });
   s.on('presence', p => {
     if (p.user !== state.other) return;
@@ -738,7 +742,8 @@ function switchTab(t) {
   if (t === 'memories') loadMemories();
 }
 $$('.tab').forEach(b => b.addEventListener('click', () => switchTab(b.dataset.tab)));
-document.addEventListener('visibilitychange', () => { if (chatVisible() && state.me) { markRead(); state.unread = 0; updateBadge(); } });
+document.addEventListener('visibilitychange', () => {
+  if (state.socket && state.socket.connected) state.socket.emit('visible', { visible: !document.hidden }); if (chatVisible() && state.me) { markRead(); state.unread = 0; updateBadge(); } });
 window.addEventListener('focus', () => { if (chatVisible() && state.me) markRead(); });
 
 // --------------------------------------------------------------- memories
@@ -825,6 +830,66 @@ function applyTheme(t, animate) {
 $$('.theme-toggle').forEach(b => b.addEventListener('click', () =>
   applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark', true)));
 applyTheme(document.documentElement.dataset.theme || 'light', false);
+
+// ---------------------------------------------------- phone notifications
+const pushSupported = 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const pushOn = () => localStorage.getItem('push') === '1';
+function updateBell() {
+  const b = $('#bellBtn');
+  b.classList.toggle('hidden', state.me !== 'Mayank');  // only Mayank gets notifications
+  b.textContent = pushOn() && pushSupported && Notification.permission === 'granted' ? '🔔' : '🔕';
+  b.title = b.textContent === '🔔' ? 'Notifications on (band karne ke liye dabao)' : 'Notifications on karo';
+}
+function b64ToBytes(b) {
+  const s = (b + '='.repeat((4 - b.length % 4) % 4)).replace(/-/g, '+').replace(/_/g, '/');
+  return Uint8Array.from(atob(s), c => c.charCodeAt(0));
+}
+function sameKey(buf, bytes) {
+  if (!buf) return false;
+  const a = new Uint8Array(buf);
+  return a.length === bytes.length && a.every((v, i) => v === bytes[i]);
+}
+async function subscribePush(askPermission) {
+  if (!pushSupported) { toast('Notifications ke liye site HTTPS (Render) par kholo, Chrome mein.'); return false; }
+  if (Notification.permission !== 'granted') {
+    if (!askPermission) return false;
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { toast('Notification allow nahi hui. Chrome ki site settings mein allow karo.'); return false; }
+  }
+  const { key } = await api('/api/push/key');
+  const keyBytes = b64ToBytes(key);
+  await navigator.serviceWorker.register('/sw.js');
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (sub && !sameKey(sub.options && sub.options.applicationServerKey, keyBytes)) { await sub.unsubscribe(); sub = null; }
+  if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: keyBytes });
+  await api('/api/push/subscribe', { method: 'POST', body: sub.toJSON() });
+  localStorage.setItem('push', '1');
+  return true;
+}
+async function syncPush() {
+  if (!pushSupported || !pushOn() || Notification.permission !== 'granted') return;
+  try { await subscribePush(false); } catch (e) { /* ignore */ }
+  updateBell();
+}
+async function detachPush() {
+  if (!pushSupported) return;
+  const reg = await navigator.serviceWorker.getRegistration();
+  const sub = reg && await reg.pushManager.getSubscription();
+  if (sub) await api('/api/push/unsubscribe', { method: 'POST', body: { endpoint: sub.endpoint } });
+}
+$('#bellBtn').addEventListener('click', async () => {
+  try {
+    if (pushOn() && Notification.permission === 'granted') {
+      await detachPush();
+      const reg = await navigator.serviceWorker.getRegistration();
+      const sub = reg && await reg.pushManager.getSubscription();
+      if (sub) await sub.unsubscribe();
+      localStorage.setItem('push', '0'); toast('Notifications band kar di');
+    } else if (await subscribePush(true)) toast('Notifications on ho gayi ♡');
+  } catch (ex) { toast(ex.message || 'Notification on nahi ho payi'); }
+  updateBell();
+});
 
 // ------------------------------------------------------------------- boot
 (async function boot() {
