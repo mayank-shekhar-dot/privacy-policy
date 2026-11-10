@@ -1,5 +1,7 @@
-"""Arpita & Mayank Love ♡ — run:  pip install flask flask-socketio simple-websocket pillow  then  python app.py"""
+"""Arpita & Mayank Love ♡ — run:  pip install flask flask-socketio simple-websocket pillow  then  python app.py  (for phone notifications also: pip install pywebpush)"""
 import os
+import json
+import base64
 import sqlite3
 import secrets
 import uuid
@@ -67,7 +69,42 @@ socketio = SocketIO(
     cors_allowed_origins=[o.strip() for o in origins.split(",")] if origins else None,
 )
 
-online = {u: set() for u in USERS}  # username -> set of socket ids
+online = {u: set() for u in USERS}   # username -> socket ids (connected)
+viewing = {u: set() for u in USERS}  # username -> socket ids whose page is visible right now
+
+# ---- push notifications (Android Chrome etc.) ----
+try:
+    from pywebpush import webpush, WebPushException
+    from py_vapid import Vapid
+    from cryptography.hazmat.primitives import serialization
+    PUSH_OK = True
+except Exception:
+    PUSH_OK = False
+VAPID_SUB = os.environ.get("VAPID_EMAIL", "mailto:admin@example.com")
+NOTIFY_USERS = {"Mayank"}  # only these people get phone notifications
+SHOW_PREVIEW = False  # True = lock screen shows the message text; False = only "new message"
+
+
+def load_vapid():
+    env = os.environ.get("VAPID_PRIVATE_KEY")
+    if env:
+        return Vapid.from_string(env.strip())
+    path = os.path.join(DATA_DIR, "vapid_private.pem")
+    if os.path.exists(path):
+        return Vapid.from_file(path)
+    v = Vapid()
+    v.generate_keys()
+    v.save_key(path)
+    raw = v.private_key.private_numbers().private_value.to_bytes(32, "big")
+    print("\n  New notification key created. On Render, add this environment variable so it survives restarts:")
+    print("  VAPID_PRIVATE_KEY=" + base64.urlsafe_b64encode(raw).rstrip(b"=").decode() + "\n")
+    return v
+
+
+VAPID = load_vapid() if PUSH_OK else None
+VAPID_PUBLIC = (base64.urlsafe_b64encode(VAPID.public_key.public_bytes(
+    serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)).rstrip(b"=").decode()
+    if VAPID else None)
 
 
 # --------------------------------------------------------------- database
@@ -118,6 +155,11 @@ def init_db():
             read_at TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_msg_recipient ON messages(recipient, read_at);
+        CREATE TABLE IF NOT EXISTS push_subs(
+            endpoint TEXT PRIMARY KEY,
+            user TEXT NOT NULL,
+            data TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS memories(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             uploader TEXT NOT NULL,
@@ -253,7 +295,33 @@ def create_message(sender, body, image):
     msg = msg_dict(query("SELECT * FROM messages WHERE id=?", (mid,), one=True))
     socketio.emit("new_message", msg, to=sender)
     socketio.emit("new_message", msg, to=other)
+    notify(other, sender, body, image)
     return msg
+
+
+def notify(recipient, sender, body, image):
+    """Push a notification ONLY if the recipient is not looking at the site right now."""
+    if not PUSH_OK or recipient not in NOTIFY_USERS or viewing[recipient]:
+        return
+    subs = query("SELECT endpoint, data FROM push_subs WHERE user=?", (recipient,))
+    if not subs:
+        return
+    text = ("📷 Photo" if image and not body else body[:120]) if SHOW_PREVIEW else \
+        ("📷 Photo bheji ♡" if image else "Naya message aaya ♡")
+    payload = json.dumps({"title": f"💌 {sender}", "body": text, "tag": "chat"})
+
+    def work():
+        for s in subs:
+            try:
+                webpush(json.loads(s["data"]), payload, vapid_private_key=VAPID,
+                        vapid_claims={"sub": VAPID_SUB}, ttl=86400)
+            except WebPushException as e:
+                code = getattr(getattr(e, "response", None), "status_code", None)
+                if code in (404, 410):  # subscription expired
+                    execute("DELETE FROM push_subs WHERE endpoint=?", (s["endpoint"],))
+            except Exception:
+                pass
+    socketio.start_background_task(work)
 
 
 # --------------------------------------------------------- security hooks
@@ -299,6 +367,67 @@ def index():
     with open(os.path.join(BASE_DIR, "index.html"), encoding="utf-8") as f:
         page = f.read().replace("__NONCE__", g.nonce)
     return page
+
+
+SERVICE_WORKER = """
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', e => e.waitUntil(self.clients.claim()));
+self.addEventListener('push', e => {
+  let d = {};
+  try { d = e.data.json(); } catch (_) {}
+  e.waitUntil(self.registration.showNotification(d.title || 'Arpita & Mayank Love', {
+    body: d.body || '', tag: d.tag || 'chat', renotify: true, vibrate: [120, 60, 120]
+  }));
+});
+self.addEventListener('notificationclick', e => {
+  e.notification.close();
+  e.waitUntil(clients.matchAll({ type: 'window', includeUncontrolled: true }).then(list => {
+    for (const c of list) if ('focus' in c) return c.focus();
+    return clients.openWindow('/');
+  }));
+});
+"""
+
+
+@app.get("/sw.js")
+def service_worker():
+    resp = app.response_class(SERVICE_WORKER, mimetype="application/javascript")
+    resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
+@app.get("/api/push/key")
+@login_required
+def push_key():
+    if not PUSH_OK:
+        return jsonify(error="Server par 'pywebpush' install nahi hai (pip install pywebpush)."), 501
+    return jsonify(key=VAPID_PUBLIC)
+
+
+@app.post("/api/push/subscribe")
+@login_required
+def push_subscribe():
+    sub = request.get_json(silent=True) or {}
+    keys = sub.get("keys") or {}
+    ep = sub.get("endpoint")
+    if not (isinstance(ep, str) and ep.startswith("https://") and keys.get("p256dh") and keys.get("auth")):
+        return jsonify(error="Invalid subscription"), 400
+    clean = {"endpoint": ep, "keys": {"p256dh": keys["p256dh"], "auth": keys["auth"]}}
+    with closing(conn()) as c:
+        c.execute("INSERT INTO push_subs(endpoint, user, data) VALUES(?,?,?) "
+                  "ON CONFLICT(endpoint) DO UPDATE SET user=excluded.user, data=excluded.data",
+                  (ep, session["user"], json.dumps(clean)))
+        c.commit()
+    return jsonify(ok=True)
+
+
+@app.post("/api/push/unsubscribe")
+@login_required
+def push_unsubscribe():
+    ep = (request.get_json(silent=True) or {}).get("endpoint")
+    if isinstance(ep, str):
+        execute("DELETE FROM push_subs WHERE endpoint=? AND user=?", (ep, session["user"]))
+    return jsonify(ok=True)
 
 
 failed_logins = {}  # ip -> [timestamps]
@@ -471,12 +600,24 @@ def on_disconnect():
     if user not in USERS:
         return
     online[user].discard(request.sid)
+    viewing[user].discard(request.sid)
     if not online[user]:
         seen = now_iso()
         execute("UPDATE users SET last_seen=? WHERE name=?", (seen, user))
         socketio.emit("presence", {"user": user, "online": False, "last_seen": seen},
                       to=OTHER[user])
         socketio.emit("typing", {"user": user, "typing": False}, to=OTHER[user])
+
+
+@socketio.on("visible")
+def on_visible(data):
+    user = current_user()
+    if not user:
+        return
+    if (data or {}).get("visible"):
+        viewing[user].add(request.sid)
+    else:
+        viewing[user].discard(request.sid)
 
 
 @socketio.on("send_message")
