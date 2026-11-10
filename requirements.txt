@@ -1,5 +1,6 @@
-Flask
-Flask-SocketIO
-simple-websocket
-gunicorn
-Pillow
+  Flask
+  Flask-SocketIO
+  simple-websocket
+  gunicorn
+  Pillow
+  pywebpush
