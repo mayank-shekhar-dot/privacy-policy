@@ -30,6 +30,10 @@ DEFAULT_PASSWORD = "2011"
 OTHER = {"Arpita": "Mayank", "Mayank": "Arpita"}
 PRODUCTION = os.environ.get("PRODUCTION") == "1"
 ALLOWED_FORMATS = {"JPEG": "jpg", "PNG": "png", "WEBP": "webp", "GIF": "gif"}
+REACTIONS = ["❤️", "😂", "😮", "😢", "👍", "🙏", "🔥", "🥰"]
+IMG_MAX = 10 * 1024 * 1024
+AUDIO_MAX = 10 * 1024 * 1024
+VIDEO_MAX = 50 * 1024 * 1024
 
 
 def load_secret_key():
@@ -57,7 +61,7 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=PRODUCTION,
     PERMANENT_SESSION_LIFETIME=60 * 60 * 24 * 30,
-    MAX_CONTENT_LENGTH=12 * 1024 * 1024,
+    MAX_CONTENT_LENGTH=64 * 1024 * 1024,
 )
 if PRODUCTION:  # running behind a hosting proxy that terminates HTTPS
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
@@ -160,6 +164,12 @@ def init_db():
             user TEXT NOT NULL,
             data TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS reactions(
+            message_id INTEGER NOT NULL,
+            user TEXT NOT NULL,
+            emoji TEXT NOT NULL,
+            PRIMARY KEY(message_id, user)
+        );
         CREATE TABLE IF NOT EXISTS memories(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             uploader TEXT NOT NULL,
@@ -168,6 +178,11 @@ def init_db():
             created_at TEXT NOT NULL
         );
         """)
+        cols = [r[1] for r in c.execute("PRAGMA table_info(messages)")]
+        if "attachments" not in cols:
+            c.execute("ALTER TABLE messages ADD COLUMN attachments TEXT")
+        if "edited_at" not in cols:
+            c.execute("ALTER TABLE messages ADD COLUMN edited_at TEXT")
         c.commit()
     # Optional: create accounts from environment variables (handy for hosting)
     for name in USERS:
@@ -209,12 +224,41 @@ def media_url(name):
     return f"/media/{name}" if name else None
 
 
-def msg_dict(r):
+def msg_files(r):
+    files = []
+    if r["attachments"]:
+        try:
+            for f in json.loads(r["attachments"]):
+                files.append({"url": media_url(f["file"]), "kind": f["kind"]})
+        except (ValueError, KeyError, TypeError):
+            pass
+    elif r["image"]:  # messages sent by older versions
+        files.append({"url": media_url(r["image"]), "kind": "image"})
+    return files
+
+
+def msg_dict(r, reactions=None):
     return {
         "id": r["id"], "sender": r["sender"], "body": r["body"],
-        "image": media_url(r["image"]), "created_at": r["created_at"],
+        "files": msg_files(r), "created_at": r["created_at"],
         "delivered_at": r["delivered_at"], "read_at": r["read_at"],
+        "edited_at": r["edited_at"], "reactions": reactions or {},
     }
+
+
+def get_reactions(mid):
+    return {x["user"]: x["emoji"] for x in
+            query("SELECT user, emoji FROM reactions WHERE message_id=?", (mid,))}
+
+
+def rows_to_msgs(rows):
+    rx = {}
+    if rows:
+        ids = tuple(r["id"] for r in rows)
+        for x in query("SELECT message_id, user, emoji FROM reactions WHERE message_id IN (%s)"
+                       % ",".join("?" * len(ids)), ids):
+            rx.setdefault(x["message_id"], {})[x["user"]] = x["emoji"]
+    return [msg_dict(r, rx.get(r["id"])) for r in rows]
 
 
 def avatars():
@@ -276,6 +320,47 @@ def save_avatar(file_storage):
     return name
 
 
+def stream_size(fs):
+    fs.stream.seek(0, 2)
+    n = fs.stream.tell()
+    fs.stream.seek(0)
+    return n
+
+
+def save_media(fs, voice=False):
+    """Validate one uploaded photo / video / voice clip. Returns {"file", "kind"} or raises ValueError."""
+    size = stream_size(fs)
+    if size == 0:
+        raise ValueError("Khali file hai.")
+    head = fs.stream.read(16)
+    fs.stream.seek(0)
+    kind = ext = None
+    if head[4:8] == b"ftyp":
+        brand = head[8:12]
+        if brand in (b"heic", b"heix", b"hevc", b"mif1", b"msf1", b"avif", b"avis"):
+            raise ValueError("Ye photo format support nahi hai, JPG/PNG bhejo.")
+        if voice or brand in (b"M4A ", b"M4B "):
+            kind, ext = "audio", ("m4a" if brand == b"M4A " else "mp4")
+        else:
+            kind, ext = "video", ("mov" if brand == b"qt  " else "mp4")
+    elif head[:4] == b"\x1a\x45\xdf\xa3":
+        kind, ext = ("audio" if voice else "video"), "webm"
+    elif head[:4] == b"OggS":
+        kind, ext = "audio", "ogg"
+    if kind:
+        if size > (AUDIO_MAX if kind == "audio" else VIDEO_MAX):
+            raise ValueError("Video 50 MB se badi hai." if kind == "video" else "Voice message bahut badi hai.")
+        name = f"{'a' if kind == 'audio' else 'v'}_{uuid.uuid4().hex}.{ext}"
+        fs.save(os.path.join(UPLOAD_DIR, name))
+        return {"file": name, "kind": kind}
+    if size > IMG_MAX:
+        raise ValueError("Photo 10 MB se badi hai.")
+    name = save_image(fs)
+    if not name:
+        raise ValueError("Ye valid photo ya video nahi hai (JPG, PNG, GIF, WEBP, MP4, WEBM, MOV).")
+    return {"file": name, "kind": "image"}
+
+
 def delete_file(name):
     if not name:
         return
@@ -285,29 +370,39 @@ def delete_file(name):
         pass
 
 
-def create_message(sender, body, image):
+def create_message(sender, body, attachments=None):
     other = OTHER[sender]
     created = now_iso()
     delivered = created if online[other] else None
     mid = execute(
-        "INSERT INTO messages(sender, recipient, body, image, created_at, delivered_at) "
-        "VALUES(?,?,?,?,?,?)", (sender, other, body, image, created, delivered))
+        "INSERT INTO messages(sender, recipient, body, attachments, created_at, delivered_at) "
+        "VALUES(?,?,?,?,?,?)",
+        (sender, other, body, json.dumps(attachments) if attachments else None, created, delivered))
     msg = msg_dict(query("SELECT * FROM messages WHERE id=?", (mid,), one=True))
     socketio.emit("new_message", msg, to=sender)
     socketio.emit("new_message", msg, to=other)
-    notify(other, sender, body, image)
+    notify(other, sender, body, attachments)
     return msg
 
 
-def notify(recipient, sender, body, image):
+def notify(recipient, sender, body, attachments):
     """Push a notification ONLY if the recipient is not looking at the site right now."""
     if not PUSH_OK or recipient not in NOTIFY_USERS or viewing[recipient]:
         return
     subs = query("SELECT endpoint, data FROM push_subs WHERE user=?", (recipient,))
     if not subs:
         return
-    text = ("📷 Photo" if image and not body else body[:120]) if SHOW_PREVIEW else \
-        ("📷 Photo bheji ♡" if image else "Naya message aaya ♡")
+    kinds = {x["kind"] for x in (attachments or [])}
+    if SHOW_PREVIEW and body:
+        text = body[:120]
+    elif kinds == {"audio"}:
+        text = "🎤 Voice message bheja ♡"
+    elif "video" in kinds:
+        text = "🎬 Video bheja ♡"
+    elif kinds:
+        text = "📷 Photo bheji ♡"
+    else:
+        text = "Naya message aaya ♡"
     payload = json.dumps({"title": f"💌 {sender}", "body": text, "tag": "chat"})
 
     def work():
@@ -358,7 +453,7 @@ def add_headers(resp):
 
 @app.errorhandler(413)
 def too_large(_):
-    return jsonify(error="That file is too large (max 10 MB)."), 413
+    return jsonify(error="File bahut badi hai (photo/voice 10 MB, video 50 MB tak)."), 413
 
 
 # ------------------------------------------------------------------ routes
@@ -473,16 +568,25 @@ def messages():
         rows = query("SELECT * FROM messages WHERE id < ? ORDER BY id DESC LIMIT 60", (before,))
     else:
         rows = query("SELECT * FROM messages ORDER BY id DESC LIMIT 60")
-    return jsonify(messages=[msg_dict(r) for r in reversed(rows)], has_more=len(rows) == 60)
+    return jsonify(messages=rows_to_msgs(list(reversed(rows))), has_more=len(rows) == 60)
 
 
 @app.delete("/api/messages")
 @login_required
 def clear_chat():
-    """Delete the whole conversation (and shared photos) for both people."""
-    imgs = [r["image"] for r in query("SELECT image FROM messages WHERE image IS NOT NULL")]
+    """Delete the whole conversation (photos, videos, voice clips, reactions) for both people."""
+    files = []
+    for r in query("SELECT image, attachments FROM messages"):
+        if r["image"]:
+            files.append(r["image"])
+        if r["attachments"]:
+            try:
+                files += [f["file"] for f in json.loads(r["attachments"])]
+            except (ValueError, KeyError, TypeError):
+                pass
     execute("DELETE FROM messages")
-    for name in imgs:
+    execute("DELETE FROM reactions")
+    for name in files:
         delete_file(name)
     payload = {"by": session["user"]}
     socketio.emit("chat_cleared", payload, to="Arpita")
@@ -490,23 +594,39 @@ def clear_chat():
     return jsonify(ok=True)
 
 
-@app.post("/api/messages/image")
+@app.post("/api/messages/media")
 @login_required
-def send_image():
-    f = request.files.get("image")
-    if not f:
-        return jsonify(error="No image received."), 400
-    name = save_image(f)
-    if not name:
-        return jsonify(error="That doesn't look like a valid image (JPG, PNG, GIF or WEBP)."), 400
+def send_media():
+    files = [f for f in request.files.getlist("files") if f]
+    if not files:
+        return jsonify(error="Koi file nahi mili."), 400
+    if len(files) > 10:
+        return jsonify(error="Ek baar mein 10 files tak bhej sakte ho."), 400
+    voice = request.form.get("voice") == "1" and len(files) == 1
+    saved = []
+    try:
+        for f in files:
+            saved.append(save_media(f, voice))
+    except ValueError as e:
+        for s in saved:
+            delete_file(s["file"])
+        return jsonify(error=str(e)), 400
     caption = (request.form.get("body") or "").strip()[:2000]
-    return jsonify(create_message(session["user"], caption, name))
+    return jsonify(create_message(session["user"], caption, saved))
+
+
+MIMES = {"webm": ("video/webm", "audio/webm"), "mp4": ("video/mp4", "audio/mp4"),
+         "m4a": ("audio/mp4", "audio/mp4"), "mov": ("video/quicktime", "video/quicktime"),
+         "ogg": ("audio/ogg", "audio/ogg")}
 
 
 @app.get("/media/<path:name>")
 @login_required
 def media(name):
-    resp = send_from_directory(UPLOAD_DIR, secure_filename(name))
+    name = secure_filename(name)
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    mime = MIMES[ext][1 if name.startswith("a_") else 0] if ext in MIMES else None
+    resp = send_from_directory(UPLOAD_DIR, name, mimetype=mime)  # supports Range (video seeking)
     resp.headers["Cache-Control"] = "private, max-age=86400"
     return resp
 
@@ -633,6 +753,54 @@ def on_send(data):
         return {"ok": False, "error": "Message is too long"}
     create_message(user, body, None)
     return {"ok": True}
+
+
+@socketio.on("edit_message")
+def on_edit(data):
+    user = current_user()
+    if not user:
+        return {"ok": False, "error": "Not logged in"}
+    try:
+        mid = int((data or {}).get("id"))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "Invalid message"}
+    body = (data or {}).get("body")
+    row = query("SELECT sender FROM messages WHERE id=?", (mid,), one=True)
+    if not row or row["sender"] != user:
+        return {"ok": False, "error": "Sirf apna message edit kar sakte ho."}
+    if not isinstance(body, str) or not body.strip() or len(body.strip()) > 2000:
+        return {"ok": False, "error": "Message khali ya bahut lamba hai."}
+    at = now_iso()
+    execute("UPDATE messages SET body=?, edited_at=? WHERE id=?", (body.strip(), at, mid))
+    payload = {"id": mid, "body": body.strip(), "edited_at": at}
+    for u in USERS:
+        socketio.emit("message_edited", payload, to=u)
+    return {"ok": True}
+
+
+@socketio.on("react")
+def on_react(data):
+    user = current_user()
+    if not user:
+        return
+    try:
+        mid = int((data or {}).get("id"))
+    except (TypeError, ValueError):
+        return
+    emoji = (data or {}).get("emoji")
+    if not query("SELECT 1 FROM messages WHERE id=?", (mid,), one=True):
+        return
+    cur = query("SELECT emoji FROM reactions WHERE message_id=? AND user=?", (mid, user), one=True)
+    if emoji is None or (cur and cur["emoji"] == emoji):
+        execute("DELETE FROM reactions WHERE message_id=? AND user=?", (mid, user))
+    elif emoji in REACTIONS:
+        execute("INSERT INTO reactions(message_id, user, emoji) VALUES(?,?,?) "
+                "ON CONFLICT(message_id, user) DO UPDATE SET emoji=excluded.emoji", (mid, user, emoji))
+    else:
+        return
+    payload = {"id": mid, "reactions": get_reactions(mid)}
+    for u in USERS:
+        socketio.emit("reactions", payload, to=u)
 
 
 @socketio.on("typing")
