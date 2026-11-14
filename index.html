@@ -205,6 +205,48 @@ input,textarea{font:inherit;color:inherit}
 .theme-anim,.theme-anim *{transition:background-color .45s,color .45s,border-color .45s,box-shadow .45s!important}
 
 .head-actions{gap:2px}.head-actions .icon-btn{width:34px;height:34px;font-size:1.05rem}.avatar.me{width:34px;height:34px}
+
+/* ---- v3: media, reactions, edit, voice, emergency ---- */
+.bwrap{display:flex;flex-direction:column;min-width:0;max-width:min(78%,520px)}
+.row.mine .bwrap{align-items:flex-end}.row.theirs .bwrap{align-items:flex-start}
+.bwrap .bubble{max-width:100%;cursor:pointer}
+.bubble.wide{width:min(78vw,340px)}
+.media{display:grid;gap:4px;margin:2px 0 6px;max-width:min(72vw,340px)}
+.media.multi{grid-template-columns:1fr 1fr;width:min(72vw,340px)}
+.media img,.media video{width:100%;border-radius:14px;display:block}
+.media img.media-img{cursor:zoom-in;max-height:340px;object-fit:cover;background:rgba(var(--wh),.5)}
+.media.multi img.media-img{aspect-ratio:1;max-height:none}
+.media video{max-height:300px;background:#000}
+.media.multi video{grid-column:1/-1}
+.media audio{width:100%;min-width:210px;height:40px;grid-column:1/-1}
+.reacts{display:flex;gap:3px;margin-top:-7px;padding:0 8px;position:relative;z-index:1}
+.reacts:empty{display:none}
+.reacts span{background:rgba(var(--wh),.97);border:1px solid var(--glass-b);border-radius:999px;padding:1px 7px;font-size:.88rem;box-shadow:0 2px 8px rgba(var(--sh),.2);color:var(--ink)}
+.row.has-react{margin-bottom:10px}
+.edited{font-style:italic}
+.msg-menu{position:fixed;z-index:70;display:flex;flex-direction:column;gap:6px;padding:8px;border-radius:22px;max-width:94vw;animation:fade .2s}
+.msg-menu .em{display:flex;gap:2px;flex-wrap:wrap;justify-content:center}
+.msg-menu .em button{font-size:1.45rem;width:38px;height:38px;border-radius:50%;transition:transform .15s}
+.msg-menu .em button:hover{transform:scale(1.25)}.msg-menu .em button.on{background:rgba(var(--wh),.95);box-shadow:0 0 0 2px var(--rose)}
+.msg-menu .act{padding:8px 12px;border-radius:14px;font-weight:600;text-align:left}.msg-menu .act:hover{background:rgba(var(--wh),.9)}
+.editbar,.preview{align-items:center}
+.editbar{display:flex;justify-content:space-between;margin:0 10px;padding:6px 8px 6px 16px;border-radius:20px;font-size:.88rem;color:var(--ink2)}
+.thumbs{display:flex;gap:6px;flex-wrap:wrap;max-width:60%}
+.thumbs .th{position:relative;width:46px;height:46px;border-radius:10px;overflow:hidden;background:#000}
+.thumbs .th img,.thumbs .th video{width:100%;height:100%;object-fit:cover;display:block}
+.thumbs .th b{position:absolute;right:2px;bottom:0;font-size:.8rem}
+.preview{flex-wrap:wrap}
+.recbar{display:none;flex:1;align-items:center;gap:10px;padding:4px 6px 4px 12px}
+.recbar span{flex:1;color:var(--ink2)}
+.composer.recording>:not(.recbar){display:none!important}
+.composer.recording .recbar{display:flex}
+.rec-dot{width:12px;height:12px;border-radius:50%;background:#e5484d;animation:pulse 1s infinite;display:inline-block}
+.icon-btn.danger:hover{background:rgba(229,72,77,.18)}
+.who-head>div{min-width:0}.status span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+@media(max-width:420px){
+  .head-actions .icon-btn{width:30px;height:30px;font-size:.95rem}.avatar.me{width:30px;height:30px}
+  .topbar{padding-left:10px;padding-right:10px}.who-head{gap:8px}.who-head .avatar{width:40px;height:40px}.name{font-size:1.4rem}
+}
 </style>
 </head>
 <body>
@@ -251,6 +293,7 @@ input,textarea{font:inherit;color:inherit}
       </div>
     </div>
     <div class="head-actions">
+      <button class="icon-btn danger" id="sosBtn" type="button" aria-label="Emergency" title="Emergency">⚠️</button>
       <button class="icon-btn" id="bellBtn" type="button" aria-label="Notifications" title="Notifications"></button>
       <button class="icon-btn" id="clearBtn" type="button" aria-label="Clear chat" title="Chat clear karein">🧹</button>
       <button class="icon-btn theme-toggle" id="themeBtn" type="button" aria-label="Switch day or night theme"></button>
@@ -273,17 +316,20 @@ input,textarea{font:inherit;color:inherit}
         <div class="emoji-grid" id="emojiGrid"></div>
       </div>
       <div id="preview" class="preview glass hidden">
-        <img id="previewImg" alt="Selected photo preview"><span>Add a caption (optional) and send ♡</span>
-        <button class="icon-btn" id="previewCancel" aria-label="Remove photo">✕</button>
+        <div id="previewThumbs" class="thumbs"></div><span id="previewLabel">Caption likho aur bhejo ♡</span>
+        <button class="icon-btn" id="previewCancel" type="button" aria-label="Remove files">✕</button>
       </div>
+      <div id="editBar" class="editbar glass hidden"><span>✏️ Message edit ho raha hai</span><button class="icon-btn" id="editCancel" type="button" aria-label="Cancel edit">✕</button></div>
       <form id="composer" class="composer glass">
-        <button type="button" class="icon-btn" id="attachBtn" aria-label="Send a photo">📷</button>
+        <button type="button" class="icon-btn" id="attachBtn" aria-label="Photos ya videos bhejo" title="Photos / videos">📷</button>
         <button type="button" class="icon-btn" id="emojiBtn" aria-label="Emoji">😊</button>
         <textarea id="input" rows="1" maxlength="2000" placeholder="Write something sweet…" aria-label="Message"></textarea>
+        <button type="button" class="icon-btn" id="micBtn" aria-label="Voice message" title="Voice message">🎤</button>
         <button type="submit" class="send" id="sendBtn" aria-label="Send">
           <svg viewBox="0 0 24 24" width="20" height="20"><path d="M3 11.5 20.5 4l-6.8 16-2.6-6.4z" fill="currentColor"/></svg>
         </button>
-        <input type="file" id="chatFile" accept="image/jpeg,image/png,image/gif,image/webp" hidden>
+        <div class="recbar" id="recBar"><i class="rec-dot"></i><b id="recTime">0:00</b><span>Recording…</span><button type="button" class="icon-btn" id="recCancel" aria-label="Cancel recording">🗑</button><button type="button" class="send" id="recSend" aria-label="Send voice message">✓</button></div>
+        <input type="file" id="chatFile" accept="image/jpeg,image/png,image/gif,image/webp,video/mp4,video/webm,video/quicktime" multiple hidden>
       </form>
     </section>
 
@@ -346,6 +392,7 @@ input,textarea{font:inherit;color:inherit}
   <input type="file" id="avatarFile" accept="image/jpeg,image/png,image/webp" hidden>
 </dialog>
 
+<div id="msgMenu" class="msg-menu glass hidden"></div>
 <dialog id="lightbox" class="lightbox"><img id="lightImg" alt="Photo"></dialog>
 <div id="toast" class="toast hidden" role="status"></div>
 
@@ -527,6 +574,8 @@ function connectSocket() {
     updateStatus();
   });
   s.on('new_message', addMessage);
+  s.on('reactions', applyReactions);
+  s.on('message_edited', applyEdit);
   s.on('chat_cleared', ({ by }) => {
     state.messages = []; state.oldest = null; state.hasMore = false; state.unread = 0;
     $('#msgList').textContent = ''; $('#olderBtn').classList.add('hidden'); updateBadge();
@@ -572,6 +621,26 @@ function buildMessage(m, prev) {
     const sp = document.createElement('span'); sp.textContent = dayLabel(m.created_at);
     d.appendChild(sp); frag.appendChild(d);
   }
+  frag.appendChild(buildRow(m, prev));
+  return frag;
+}
+
+function buildFile(f, bubble) {
+  let el;
+  if (f.kind === 'video') {
+    el = document.createElement('video'); el.controls = true; el.preload = 'metadata'; el.playsInline = true; el.src = f.url;
+    el.addEventListener('loadedmetadata', () => { if (bubble.dataset.stick) scrollBottom(true); });
+  } else if (f.kind === 'audio') {
+    el = document.createElement('audio'); el.controls = true; el.preload = 'metadata'; el.src = f.url;
+  } else {
+    el = new Image(); el.src = f.url; el.alt = 'Shared photo'; el.loading = 'lazy'; el.className = 'media-img';
+    el.addEventListener('click', () => openLightbox(f.url));
+    el.addEventListener('load', () => { if (bubble.dataset.stick) scrollBottom(true); });
+  }
+  return el;
+}
+
+function buildRow(m, prev) {
   const mine = m.sender === state.me;
   const cont = prev && prev.sender === m.sender && dayLabel(prev.created_at) === dayLabel(m.created_at)
     && (new Date(m.created_at) - new Date(prev.created_at)) < 5 * 60000;
@@ -579,15 +648,18 @@ function buildMessage(m, prev) {
   row.className = `row ${mine ? 'mine' : 'theirs'}${cont ? ' cont' : ''}`;
   row.dataset.id = m.id;
   const av = document.createElement('div'); av.className = 'avatar'; av.dataset.user = m.sender; fillAvatar(av);
+  const wrap = document.createElement('div'); wrap.className = 'bwrap';
   const b = document.createElement('div'); b.className = `bubble ${m.sender}`;
-  if (m.image) {
-    const img = new Image(); img.className = 'img'; img.src = m.image; img.alt = 'Shared photo'; img.loading = 'lazy';
-    img.addEventListener('click', () => openLightbox(m.image));
-    img.addEventListener('load', () => { if (b.dataset.stick) scrollBottom(true); });
-    b.appendChild(img);
+  const files = m.files || [];
+  if (files.length) {
+    const g = document.createElement('div'); g.className = 'media' + (files.length > 1 ? ' multi' : '');
+    files.forEach(f => g.appendChild(buildFile(f, b)));
+    b.appendChild(g);
+    if (files.some(f => f.kind !== 'image')) b.classList.add('wide');
   }
   if (m.body) { const t = document.createElement('div'); t.className = 'txt'; t.textContent = m.body; b.appendChild(t); }
   const meta = document.createElement('div'); meta.className = 'meta';
+  if (m.edited_at) { const e = document.createElement('span'); e.className = 'edited'; e.textContent = 'edited'; meta.appendChild(e); }
   const time = document.createElement('span'); time.textContent = fmtTime(m.created_at); meta.appendChild(time);
   if (mine) {
     const [txt, cls, title] = tickInfo(m);
@@ -595,10 +667,75 @@ function buildMessage(m, prev) {
     meta.appendChild(tk);
   }
   b.appendChild(meta);
-  row.append(av, b);
-  frag.appendChild(row);
-  return frag;
+  b.addEventListener('click', e => {
+    if (e.target.closest('img,video,audio')) return;
+    e.stopPropagation(); openMenu(m.id, b);
+  });
+  const rc = document.createElement('div'); rc.className = 'reacts';
+  wrap.append(b, rc); row.append(av, wrap);
+  fillReacts(row, m);
+  return row;
 }
+
+// ---- reactions + edit (message menu)
+function fillReacts(row, m) {
+  const rc = $('.reacts', row); rc.textContent = '';
+  const counts = {};
+  Object.values(m.reactions || {}).forEach(e => { counts[e] = (counts[e] || 0) + 1; });
+  Object.entries(counts).forEach(([e, n]) => {
+    const s = document.createElement('span'); s.textContent = n > 1 ? `${e} ${n}` : e; rc.appendChild(s);
+  });
+  rc.title = Object.entries(m.reactions || {}).map(([u, e]) => `${u}: ${e}`).join('   ');
+  row.classList.toggle('has-react', rc.children.length > 0);
+}
+function applyReactions({ id, reactions }) {
+  const m = state.messages.find(x => x.id === id); if (!m) return;
+  m.reactions = reactions;
+  const row = $(`.row[data-id="${id}"]`); if (row) fillReacts(row, m);
+}
+function applyEdit({ id, body, edited_at }) {
+  const m = state.messages.find(x => x.id === id); if (!m) return;
+  m.body = body; m.edited_at = edited_at;
+  const row = $(`.row[data-id="${id}"]`); if (!row) return;
+  const b = $('.bubble', row), meta = $('.meta', b);
+  let t = $('.txt', b);
+  if (!t) { t = document.createElement('div'); t.className = 'txt'; b.insertBefore(t, meta); }
+  t.textContent = body;
+  if (!$('.edited', meta)) { const e = document.createElement('span'); e.className = 'edited'; e.textContent = 'edited'; meta.prepend(e); }
+}
+
+const QUICK = ['❤️', '😂', '😮', '😢', '👍', '🙏', '🔥', '🥰'];
+function closeMenu() { $('#msgMenu').classList.add('hidden'); }
+function openMenu(id, bubble) {
+  const m = state.messages.find(x => x.id === id); if (!m) return;
+  const menu = $('#msgMenu'); menu.textContent = '';
+  const em = document.createElement('div'); em.className = 'em';
+  QUICK.forEach(e => {
+    const b = document.createElement('button'); b.type = 'button'; b.textContent = e;
+    if ((m.reactions || {})[state.me] === e) b.classList.add('on');
+    b.addEventListener('click', ev => {
+      ev.stopPropagation(); closeMenu();
+      if (state.socket) state.socket.emit('react', { id: m.id, emoji: e });
+    });
+    em.appendChild(b);
+  });
+  menu.appendChild(em);
+  if (m.sender === state.me) {
+    const eb = document.createElement('button'); eb.type = 'button'; eb.className = 'act'; eb.textContent = '✏️ Message edit karo';
+    eb.addEventListener('click', ev => { ev.stopPropagation(); closeMenu(); startEdit(m); });
+    menu.appendChild(eb);
+  }
+  menu.style.visibility = 'hidden'; menu.classList.remove('hidden');
+  const r = bubble.getBoundingClientRect(), w = menu.offsetWidth, hgt = menu.offsetHeight;
+  const left = Math.min(Math.max(8, r.left + r.width / 2 - w / 2), window.innerWidth - w - 8);
+  let top = r.top - hgt - 8;
+  if (top < 70) top = Math.min(r.bottom + 8, window.innerHeight - hgt - 8);
+  menu.style.left = left + 'px'; menu.style.top = top + 'px'; menu.style.visibility = '';
+}
+document.addEventListener('click', closeMenu);
+$('#msgMenu').addEventListener('click', e => e.stopPropagation());
+$('#messages').addEventListener('scroll', closeMenu, { passive: true });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeMenu(); });
 
 function renderAll(toBottom) {
   const box = $('#messages'), list = $('#msgList');
@@ -665,19 +802,35 @@ input.addEventListener('keydown', e => {
   }
 });
 
+state.pendingFiles = []; state.editing = null;
+
+async function uploadFiles(files, caption, voice) {
+  const fd = new FormData();
+  files.forEach(f => fd.append('files', f));
+  fd.append('body', caption || '');
+  if (voice) fd.append('voice', '1');
+  try { addMessage(await api('/api/messages/media', { method: 'POST', body: fd })); return true; }
+  catch (ex) { toast(ex.message); return false; }
+}
+
 $('#composer').addEventListener('submit', async e => {
   e.preventDefault();
   const body = input.value.trim();
+  if (state.editing) {
+    const id = state.editing, m = state.messages.find(x => x.id === id);
+    if (!body) { toast('Message khali nahi ho sakta'); return; }
+    if (m && m.body === body) { cancelEdit(); return; }
+    if (!state.socket || !state.socket.connected) { toast('Reconnecting… thodi der mein try karo ♡'); return; }
+    state.socket.emit('edit_message', { id, body }, res => { if (res && !res.ok) toast(res.error || 'Edit nahi ho paya'); });
+    cancelEdit(); stopTyping(); return;
+  }
   const sendBtn = $('#sendBtn');
-  if (state.pendingFile) {
-    const fd = new FormData(); fd.append('image', state.pendingFile); fd.append('body', body);
-    sendBtn.disabled = true;
-    try {
-      const m = await api('/api/messages/image', { method: 'POST', body: fd });
-      addMessage(m); clearPending(); input.value = ''; autoGrow(); burst(sendBtn);
-    } catch (ex) { toast(ex.message); }
-    sendBtn.disabled = false; stopTyping();
-    return;
+  if (state.pendingFiles.length) {
+    sendBtn.disabled = true; toast('Bhej rahe hain…');
+    const ok = await uploadFiles(state.pendingFiles, body, false);
+    sendBtn.disabled = false;
+    if (ok) { clearPending(); input.value = ''; autoGrow(); burst(sendBtn); }
+    stopTyping(); return;
   }
   if (!body) return;
   if (!state.socket || !state.socket.connected) { toast('Reconnecting… try again in a moment ♡'); return; }
@@ -686,22 +839,112 @@ $('#composer').addEventListener('submit', async e => {
   $('#emojiPanel').classList.add('hidden');
 });
 
-// image attach
-$('#attachBtn').addEventListener('click', () => $('#chatFile').click());
-$('#chatFile').addEventListener('change', e => {
-  const f = e.target.files[0]; e.target.value = '';
-  if (!f) return;
-  if (!/^image\/(jpeg|png|gif|webp)$/.test(f.type)) { toast('Please choose a JPG, PNG, GIF or WEBP image.'); return; }
-  if (f.size > 10 * 1024 * 1024) { toast('That photo is over 10 MB.'); return; }
-  clearPending(); state.pendingFile = f;
-  $('#previewImg').src = URL.createObjectURL(f);
-  $('#preview').classList.remove('hidden'); input.focus();
+// edit mode
+function startEdit(m) {
+  clearPending(); state.editing = m.id;
+  $('#editBar').classList.remove('hidden');
+  input.value = m.body || ''; autoGrow(); input.focus();
+}
+function cancelEdit() {
+  state.editing = null; $('#editBar').classList.add('hidden'); input.value = ''; autoGrow();
+}
+$('#editCancel').addEventListener('click', cancelEdit);
+
+// photos + videos (several at once)
+$('#attachBtn').addEventListener('click', () => {
+  if (state.editing) { toast('Pehle edit poora ya cancel karo'); return; }
+  $('#chatFile').click();
 });
+$('#chatFile').addEventListener('change', e => {
+  const picked = [...e.target.files]; e.target.value = '';
+  for (const f of picked) {
+    const img = /^image\/(jpeg|png|gif|webp)$/.test(f.type), vid = /^video\/(mp4|webm|quicktime)$/.test(f.type);
+    if (!img && !vid) { toast('Sirf JPG/PNG/GIF/WEBP photo ya MP4/WEBM/MOV video bhejo.'); continue; }
+    if (img && f.size > 10 * 1024 * 1024) { toast('Photo 10 MB se badi hai.'); continue; }
+    if (vid && f.size > 50 * 1024 * 1024) { toast('Video 50 MB se badi hai.'); continue; }
+    if (state.pendingFiles.length >= 10) { toast('Ek baar mein 10 files tak.'); break; }
+    state.pendingFiles.push(f);
+  }
+  renderPending(); input.focus();
+});
+function renderPending() {
+  const box = $('#previewThumbs'); box.textContent = '';
+  state.pendingFiles.forEach(f => {
+    if (!f._url) f._url = URL.createObjectURL(f);
+    const th = document.createElement('div'); th.className = 'th';
+    if (f.type.startsWith('video/')) {
+      const v = document.createElement('video'); v.src = f._url; v.muted = true; v.preload = 'metadata'; th.appendChild(v);
+      const b = document.createElement('b'); b.textContent = '🎬'; th.appendChild(b);
+    } else { const i = new Image(); i.src = f._url; i.alt = ''; th.appendChild(i); }
+    box.appendChild(th);
+  });
+  const n = state.pendingFiles.length;
+  $('#previewLabel').textContent = `${n} file${n > 1 ? 's' : ''} ready. Caption likho aur bhejo ♡`;
+  $('#preview').classList.toggle('hidden', n === 0);
+}
 function clearPending() {
-  if (state.pendingFile) URL.revokeObjectURL($('#previewImg').src);
-  state.pendingFile = null; $('#preview').classList.add('hidden');
+  state.pendingFiles.forEach(f => f._url && URL.revokeObjectURL(f._url));
+  state.pendingFiles = []; renderPending();
 }
 $('#previewCancel').addEventListener('click', clearPending);
+
+// voice messages (recorded clips, not calls)
+const rec = { mr: null, chunks: [], stream: null, timer: null, t0: 0, send: false };
+function recMime() {
+  if (!window.MediaRecorder) return '';
+  return ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg;codecs=opus'].find(t => MediaRecorder.isTypeSupported(t)) || '';
+}
+async function startRec() {
+  if (state.editing) { toast('Pehle edit poora ya cancel karo'); return; }
+  if (!navigator.mediaDevices || !window.MediaRecorder) { toast('Voice message ke liye Chrome aur HTTPS chahiye.'); return; }
+  try { rec.stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  catch (e) { toast('Microphone allow nahi hua. Chrome settings mein allow karo.'); return; }
+  const mime = recMime(); rec.chunks = []; rec.send = false;
+  rec.mr = new MediaRecorder(rec.stream, mime ? { mimeType: mime } : undefined);
+  rec.mr.ondataavailable = ev => { if (ev.data && ev.data.size) rec.chunks.push(ev.data); };
+  rec.mr.onstop = onRecStop;
+  rec.mr.start();
+  rec.t0 = Date.now();
+  $('#composer').classList.add('recording');
+  $('#recTime').textContent = '0:00';
+  rec.timer = setInterval(() => {
+    const s = Math.floor((Date.now() - rec.t0) / 1000);
+    $('#recTime').textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+    if (s >= 300) stopRec(true);
+  }, 250);
+}
+function stopRec(send) {
+  rec.send = send; clearInterval(rec.timer);
+  $('#composer').classList.remove('recording');
+  if (rec.mr && rec.mr.state !== 'inactive') rec.mr.stop();
+  if (rec.stream) rec.stream.getTracks().forEach(t => t.stop());
+}
+async function onRecStop() {
+  if (!rec.send || !rec.chunks.length) return;
+  const type = (rec.mr && rec.mr.mimeType) || 'audio/webm';
+  const blob = new Blob(rec.chunks, { type });
+  if (blob.size < 1500) { toast('Voice bahut chhoti thi, dobara try karo.'); return; }
+  const ext = type.includes('mp4') ? 'm4a' : type.includes('ogg') ? 'ogg' : 'webm';
+  toast('Voice bhej rahe hain…');
+  if (await uploadFiles([new File([blob], 'voice.' + ext, { type })], '', true)) burst($('#micBtn'));
+}
+$('#micBtn').addEventListener('click', startRec);
+$('#recSend').addEventListener('click', () => stopRec(true));
+$('#recCancel').addEventListener('click', () => stopRec(false));
+
+// emergency exit
+const SOS_URL = 'https://ncert.nic.in/textbook/pdf/jemh1ps.pdf';
+const EMERGENCY_LOGOUT = false;   // true = also log out when pressing the emergency button
+$('#sosBtn').addEventListener('click', () => {
+  try { if (rec.stream) rec.stream.getTracks().forEach(t => t.stop()); } catch (e) { /* ignore */ }
+  try { if (state.socket) state.socket.disconnect(); } catch (e) { /* ignore */ }
+  if (EMERGENCY_LOGOUT) {
+    try { fetch('/api/logout', { method: 'POST', keepalive: true, credentials: 'same-origin', headers: { 'X-CSRF-Token': state.csrf || '' } }); } catch (e) { /* ignore */ }
+  }
+  document.documentElement.style.visibility = 'hidden';
+  document.body.textContent = '';
+  window.location.replace(SOS_URL);
+});
 
 // emoji picker
 const EMOJI = {
