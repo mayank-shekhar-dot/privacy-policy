@@ -1,6 +1,8 @@
 """Arpita & Mayank Love ♡ — run:  pip install flask flask-socketio simple-websocket pillow  then  python app.py  (for phone notifications also: pip install pywebpush)"""
 import os
+import re
 import json
+import threading
 import base64
 import sqlite3
 import secrets
@@ -139,6 +141,29 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
+def get_meta(key):
+    r = query("SELECT value FROM meta WHERE key=?", (key,), one=True)
+    return r["value"] if r else None
+
+
+def set_meta(key, value):
+    execute("INSERT INTO meta(key, value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+_id_lock = threading.Lock()
+_last_ids = {}
+
+
+def new_id(table):
+    """Time-based unique id (never repeats, even after the server is wiped and restored)."""
+    with _id_lock:
+        top = query(f"SELECT MAX(id) AS m FROM {table}", one=True)["m"] or 0
+        nid = max(int(time.time() * 1000) * 1000, _last_ids.get(table, 0) + 1, top + 1)
+        _last_ids[table] = nid
+        return nid
+
+
 def init_db():
     with closing(conn()) as c:
         c.executescript("""
@@ -163,6 +188,13 @@ def init_db():
             endpoint TEXT PRIMARY KEY,
             user TEXT NOT NULL,
             data TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS meta(
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        CREATE TABLE IF NOT EXISTS tombstones(
+            id INTEGER PRIMARY KEY
         );
         CREATE TABLE IF NOT EXISTS reactions(
             message_id INTEGER NOT NULL,
@@ -374,10 +406,11 @@ def create_message(sender, body, attachments=None):
     other = OTHER[sender]
     created = now_iso()
     delivered = created if online[other] else None
-    mid = execute(
-        "INSERT INTO messages(sender, recipient, body, attachments, created_at, delivered_at) "
-        "VALUES(?,?,?,?,?,?)",
-        (sender, other, body, json.dumps(attachments) if attachments else None, created, delivered))
+    mid = new_id("messages")
+    execute(
+        "INSERT INTO messages(id, sender, recipient, body, attachments, created_at, delivered_at) "
+        "VALUES(?,?,?,?,?,?,?)",
+        (mid, sender, other, body, json.dumps(attachments) if attachments else None, created, delivered))
     msg = msg_dict(query("SELECT * FROM messages WHERE id=?", (mid,), one=True))
     socketio.emit("new_message", msg, to=sender)
     socketio.emit("new_message", msg, to=other)
@@ -525,6 +558,172 @@ def push_unsubscribe():
     return jsonify(ok=True)
 
 
+# ---------------------------------------------------------------- browser <-> server sync
+# Every browser keeps its own copy of the chat. If this server is ever wiped (free hosting),
+# the browser sends its copy back here, and if the browser is wiped it simply downloads from here.
+MEDIA_NAME = r"[A-Za-z0-9_]{1,80}\.(?:jpg|png|webp|gif|mp4|mov|webm|m4a|ogg)"
+TS_RE = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?Z$")
+EXT_FMT = {"jpg": "JPEG", "png": "PNG", "webp": "WEBP", "gif": "GIF"}
+
+
+def url_to_name(url):
+    m = re.fullmatch(r"/media/(" + MEDIA_NAME + ")", url or "")
+    return m.group(1) if m else None
+
+
+def clean_ts(v, default=None):
+    return v if isinstance(v, str) and TS_RE.match(v) else default
+
+
+def valid_blob(fs, name):
+    ext = name.rsplit(".", 1)[1].lower()
+    size = stream_size(fs)
+    if size == 0:
+        return False
+    head = fs.stream.read(16)
+    fs.stream.seek(0)
+    limit = AUDIO_MAX if name.startswith("a_") else VIDEO_MAX if name.startswith("v_") else IMG_MAX
+    if size > limit:
+        return False
+    if ext in EXT_FMT:
+        try:
+            img = Image.open(fs.stream)
+            ok = img.format == EXT_FMT[ext] and img.width * img.height <= 60_000_000
+            if ok:
+                img.verify()
+        except Exception:
+            ok = False
+        fs.stream.seek(0)
+        return ok
+    if ext in ("mp4", "mov", "m4a"):
+        return head[4:8] == b"ftyp"
+    if ext == "webm":
+        return head[:4] == b"\x1a\x45\xdf\xa3"
+    if ext == "ogg":
+        return head[:4] == b"OggS"
+    return False
+
+
+@app.get("/api/sync/state")
+@login_required
+def sync_state():
+    return jsonify(epoch=get_meta("epoch"))
+
+
+@app.post("/api/sync/adopt")
+@login_required
+def sync_adopt():
+    ep = str((request.get_json(silent=True) or {}).get("epoch", ""))
+    if not re.fullmatch(r"[A-Za-z0-9]{8,64}", ep):
+        return jsonify(error="bad epoch"), 400
+    cur = get_meta("epoch")
+    if not cur:
+        set_meta("epoch", ep)
+        cur = ep
+    return jsonify(epoch=cur)
+
+
+@app.get("/api/sync/ids")
+@login_required
+def sync_ids():
+    return jsonify(
+        messages=[r["id"] for r in query("SELECT id FROM messages")],
+        memories=[r["id"] for r in query("SELECT id FROM memories")],
+        tombstones=[r["id"] for r in query("SELECT id FROM tombstones")],
+        files=os.listdir(UPLOAD_DIR))
+
+
+@app.post("/api/sync/messages")
+@login_required
+def sync_messages():
+    items = (request.get_json(silent=True) or {}).get("messages")
+    if not isinstance(items, list):
+        return jsonify(error="bad data"), 400
+    added = 0
+    with closing(conn()) as c:
+        for m in items[:200]:
+            try:
+                mid = int(m["id"])
+                sender = m["sender"]
+                if mid <= 0 or sender not in USERS:
+                    continue
+                atts = []
+                for f in (m.get("files") or [])[:10]:
+                    n = url_to_name(f.get("url"))
+                    if n and f.get("kind") in ("image", "video", "audio"):
+                        atts.append({"file": n, "kind": f["kind"]})
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO messages(id, sender, recipient, body, attachments, created_at, "
+                    "delivered_at, read_at, edited_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (mid, sender, OTHER[sender], str(m.get("body") or "")[:2000],
+                     json.dumps(atts) if atts else None, clean_ts(m.get("created_at"), now_iso()),
+                     clean_ts(m.get("delivered_at")), clean_ts(m.get("read_at")), clean_ts(m.get("edited_at"))))
+                if cur.rowcount:
+                    added += 1
+                    for u, e in (m.get("reactions") or {}).items():
+                        if u in USERS and e in REACTIONS:
+                            c.execute("INSERT OR IGNORE INTO reactions(message_id, user, emoji) VALUES(?,?,?)",
+                                      (mid, u, e))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        c.commit()
+    return jsonify(added=added)
+
+
+@app.post("/api/sync/memories")
+@login_required
+def sync_memories():
+    items = (request.get_json(silent=True) or {}).get("memories")
+    if not isinstance(items, list):
+        return jsonify(error="bad data"), 400
+    added = 0
+    with closing(conn()) as c:
+        dead = {r[0] for r in c.execute("SELECT id FROM tombstones")}
+        for m in items[:200]:
+            try:
+                mid = int(m["id"])
+                name = url_to_name(m.get("image"))
+                if mid <= 0 or mid in dead or not name or m.get("uploader") not in USERS:
+                    continue
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO memories(id, uploader, filename, caption, created_at) VALUES(?,?,?,?,?)",
+                    (mid, m["uploader"], name, str(m.get("caption") or "")[:300],
+                     clean_ts(m.get("created_at"), now_iso())))
+                added += cur.rowcount
+            except (KeyError, TypeError, ValueError, AttributeError):
+                continue
+        c.commit()
+    return jsonify(added=added)
+
+
+@app.post("/api/sync/avatars")
+@login_required
+def sync_avatars():
+    av = (request.get_json(silent=True) or {}).get("avatars") or {}
+    for user, url in av.items():
+        name = url_to_name(url) if isinstance(url, str) else None
+        if (user in USERS and name and os.path.exists(os.path.join(UPLOAD_DIR, name))
+                and name.startswith(("a_", "v_")) is False):
+            execute("UPDATE users SET avatar=? WHERE name=? AND avatar IS NULL", (name, user))
+    return jsonify(ok=True)
+
+
+@app.post("/api/sync/file")
+@login_required
+def sync_file():
+    f = request.files.get("file")
+    name = request.form.get("name", "")
+    if not f or not re.fullmatch(MEDIA_NAME, name):
+        return jsonify(error="bad file"), 400
+    path = os.path.join(UPLOAD_DIR, name)
+    if os.path.exists(path):
+        return jsonify(ok=True, existed=True)
+    if not valid_blob(f, name):
+        return jsonify(error="invalid file"), 400
+    f.save(path)
+    return jsonify(ok=True)
+
+
 failed_logins = {}  # ip -> [timestamps]
 
 
@@ -588,7 +787,9 @@ def clear_chat():
     execute("DELETE FROM reactions")
     for name in files:
         delete_file(name)
-    payload = {"by": session["user"]}
+    epoch = secrets.token_hex(8)
+    set_meta("epoch", epoch)
+    payload = {"by": session["user"], "epoch": epoch}
     socketio.emit("chat_cleared", payload, to="Arpita")
     socketio.emit("chat_cleared", payload, to="Mayank")
     return jsonify(ok=True)
@@ -648,8 +849,8 @@ def add_memory():
     if not name:
         return jsonify(error="That doesn't look like a valid image (JPG, PNG, GIF or WEBP)."), 400
     caption = (request.form.get("caption") or "").strip()[:300]
-    execute("INSERT INTO memories(uploader, filename, caption, created_at) VALUES(?,?,?,?)",
-            (session["user"], name, caption, now_iso()))
+    execute("INSERT INTO memories(id, uploader, filename, caption, created_at) VALUES(?,?,?,?,?)",
+            (new_id("memories"), session["user"], name, caption, now_iso()))
     socketio.emit("memories_changed", {}, to="Arpita")
     socketio.emit("memories_changed", {}, to="Mayank")
     return jsonify(ok=True)
@@ -664,6 +865,7 @@ def delete_memory(mid):
     if row["uploader"] != session["user"]:
         return jsonify(error="You can only remove memories you added."), 403
     execute("DELETE FROM memories WHERE id=?", (mid,))
+    execute("INSERT OR IGNORE INTO tombstones(id) VALUES(?)", (mid,))
     delete_file(row["filename"])
     socketio.emit("memories_changed", {}, to="Arpita")
     socketio.emit("memories_changed", {}, to="Mayank")
