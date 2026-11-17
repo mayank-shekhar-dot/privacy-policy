@@ -384,6 +384,7 @@ input,textarea{font:inherit;color:inherit}
   <h3 class="script">My picture</h3>
   <div class="avatar big" id="profileAvatar" data-user=""></div>
   <p class="muted">Choose a photo you love. It shows up in the chat for both of you.</p>
+  <p id="mirrorInfo" class="muted"></p>
   <p id="avatarErr" class="error"></p>
   <div class="dlg-actions">
     <button class="btn" id="profileClose" type="button">Close</button>
@@ -520,6 +521,8 @@ $('#loginForm').addEventListener('submit', async e => {
 
 function goLogin() {
   if (state.socket) { state.socket.disconnect(); state.socket = null; }
+  if (db) { db.close(); db = null; }
+  mirror.on = false; mirror.queue = []; mirror.queued.clear();
   Object.assign(state, { me: null, csrf: null, messages: [], oldest: null, unread: 0 });
   $('#msgList').textContent = '';
   show('login');
@@ -541,6 +544,7 @@ function enterApp(info) {
   updateStatus();
   switchTab('chat');
   show('app');
+  state.mirrorReady = mirrorOpen(info.user).then(mirrorAvatars).catch(() => {});
   connectSocket();
   updateBell(); syncPush();
 }
@@ -558,7 +562,11 @@ function updateStatus() {
 function connectSocket() {
   const s = io();
   state.socket = s;
-  s.on('connect', () => { $('#conn').classList.add('hidden'); s.emit('visible', { visible: !document.hidden }); loadMessages(true); });
+  s.on('connect', async () => {
+    $('#conn').classList.add('hidden'); s.emit('visible', { visible: !document.hidden });
+    try { await state.mirrorReady; await syncStart(); } catch (e) { /* chat still works without the local copy */ }
+    loadMessages(true);
+  });
   s.on('disconnect', () => { if (state.me) $('#conn').classList.remove('hidden'); });
   s.on('presence', p => {
     if (p.user !== state.other) return;
@@ -576,15 +584,16 @@ function connectSocket() {
   s.on('new_message', addMessage);
   s.on('reactions', applyReactions);
   s.on('message_edited', applyEdit);
-  s.on('chat_cleared', ({ by }) => {
+  s.on('chat_cleared', ({ by, epoch }) => {
+    localCleared(epoch);
     state.messages = []; state.oldest = null; state.hasMore = false; state.unread = 0;
     $('#msgList').textContent = ''; $('#olderBtn').classList.add('hidden'); updateBadge();
     toast(by === state.me ? 'Chat clear ho gayi ♡' : `${by} ne chat clear kar di ♡`);
   });
   s.on('delivered', ({ ids, at }) => ids.forEach(id => patchMessage(id, { delivered_at: at })));
   s.on('read', ({ ids, at }) => ids.forEach(id => patchMessage(id, { delivered_at: at, read_at: at })));
-  s.on('memories_changed', () => { if (state.tab === 'memories') loadMemories(); });
-  s.on('avatar_changed', ({ user, avatar }) => { state.avatars[user] = avatar; refreshAvatars(); });
+  s.on('memories_changed', () => { if (state.tab === 'memories') loadMemories(); mirrorMemories(); });
+  s.on('avatar_changed', ({ user, avatar }) => { state.avatars[user] = avatar; refreshAvatars(); mirrorAvatars(); });
 }
 
 // --------------------------------------------------------------- messages
@@ -598,6 +607,8 @@ async function loadMessages(reset) {
     state.messages = reset ? d.messages : [...d.messages, ...state.messages];
     state.hasMore = d.has_more;
     state.oldest = state.messages.length ? state.messages[0].id : null;
+    mirrorMsgs(d.messages);
+    if (reset) mirrorHistory();
     renderAll(reset);
     if (chatVisible()) markRead();
   } catch (e) { toast(e.message); }
@@ -637,6 +648,7 @@ function buildFile(f, bubble) {
     el.addEventListener('click', () => openLightbox(f.url));
     el.addEventListener('load', () => { if (bubble.dataset.stick) scrollBottom(true); });
   }
+  el.addEventListener('error', () => localFallback(el, f.url));
   return el;
 }
 
@@ -691,11 +703,13 @@ function fillReacts(row, m) {
 function applyReactions({ id, reactions }) {
   const m = state.messages.find(x => x.id === id); if (!m) return;
   m.reactions = reactions;
+  mirrorPatch(id, { reactions });
   const row = $(`.row[data-id="${id}"]`); if (row) fillReacts(row, m);
 }
 function applyEdit({ id, body, edited_at }) {
   const m = state.messages.find(x => x.id === id); if (!m) return;
   m.body = body; m.edited_at = edited_at;
+  mirrorPatch(id, { body, edited_at });
   const row = $(`.row[data-id="${id}"]`); if (!row) return;
   const b = $('.bubble', row), meta = $('.meta', b);
   let t = $('.txt', b);
@@ -758,6 +772,7 @@ function addMessage(m) {
   const near = box.scrollHeight - box.scrollTop - box.clientHeight < 160;
   const prev = state.messages[state.messages.length - 1];
   state.messages.push(m);
+  mirrorMsgs([m]);
   const frag = buildMessage(m, prev);
   const bub = $('.bubble', frag); if (near || m.sender === state.me) bub.dataset.stick = '1';
   $('#msgList').appendChild(frag);
@@ -772,6 +787,7 @@ function patchMessage(id, fields) {
   const m = state.messages.find(x => x.id === id);
   if (!m) return;
   Object.assign(m, fields);
+  mirrorPatch(id, fields);
   const tk = $(`.row[data-id="${id}"] .tick`);
   if (tk) { const [txt, cls, title] = tickInfo(m); tk.textContent = txt; tk.className = `tick ${cls}`; tk.title = title; }
 }
@@ -993,12 +1009,14 @@ window.addEventListener('focus', () => { if (chatVisible() && state.me) markRead
 async function loadMemories() {
   try {
     const { memories } = await api('/api/memories');
+    mirrorMems(memories);
     const g = $('#gallery'); g.textContent = '';
     $('#galleryEmpty').classList.toggle('hidden', memories.length > 0);
     memories.forEach((m, i) => {
       const pin = document.createElement('figure'); pin.className = 'pin'; pin.style.margin = '0 0 12px';
       pin.style.animationDelay = Math.min(i, 10) * 40 + 'ms';
       const img = new Image(); img.src = m.image; img.alt = m.caption || 'A memory'; img.loading = 'lazy';
+      img.addEventListener('error', () => localFallback(img, m.image));
       img.addEventListener('click', () => openLightbox(m.image));
       pin.appendChild(img);
       if (m.caption) { const c = document.createElement('div'); c.className = 'cap'; c.textContent = m.caption; pin.appendChild(c); }
@@ -1039,7 +1057,7 @@ $('#memForm').addEventListener('submit', async e => {
 });
 
 // ---------------------------------------------------------------- profile
-$('#meBtn').addEventListener('click', () => { $('#avatarErr').textContent = ''; $('#profileDialog').showModal(); });
+$('#meBtn').addEventListener('click', () => { updateMirrorInfo(); $('#avatarErr').textContent = ''; $('#profileDialog').showModal(); });
 $('#profileClose').addEventListener('click', () => $('#profileDialog').close());
 $('#avatarBtn').addEventListener('click', () => $('#avatarFile').click());
 $('#avatarFile').addEventListener('change', async e => {
@@ -1133,6 +1151,191 @@ $('#bellBtn').addEventListener('click', async () => {
   } catch (ex) { toast(ex.message || 'Notification on nahi ho payi'); }
   updateBell();
 });
+
+// ------------------------------------- local copy of everything in this browser
+// Chat, photos, videos and voice are mirrored into this phone's browser (IndexedDB).
+// If the server is wiped, the browser sends its copy back. If the browser is wiped, it downloads from the server.
+let db = null;
+const mirror = { on: false, queue: [], active: 0, queued: new Set() };
+const randToken = () => [...crypto.getRandomValues(new Uint8Array(8))].map(b => b.toString(16).padStart(2, '0')).join('');
+const chunk = (a, n) => Array.from({ length: Math.ceil(a.length / n) }, (_, i) => a.slice(i * n, i * n + n));
+const fname = url => url.split('/').pop();
+
+function openDb(user) {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open('love-v1-' + user, 1);
+    r.onupgradeneeded = () => {
+      ['messages', 'memories'].forEach(n => r.result.createObjectStore(n, { keyPath: 'id' }));
+      r.result.createObjectStore('media'); r.result.createObjectStore('meta');
+    };
+    r.onsuccess = () => { db = r.result; res(); };
+    r.onerror = () => rej(r.error);
+  });
+}
+function idb(store, mode, fn) {
+  return new Promise((res, rej) => {
+    const t = db.transaction(store, mode), r = fn(t.objectStore(store));
+    t.oncomplete = () => res(r ? r.result : undefined);
+    t.onerror = t.onabort = () => rej(t.error);
+  });
+}
+const idbGet = (s, k) => idb(s, 'readonly', st => st.get(k));
+const idbPut = (s, v, k) => idb(s, 'readwrite', st => (k === undefined ? st.put(v) : st.put(v, k)));
+const idbDel = (s, k) => idb(s, 'readwrite', st => st.delete(k));
+const idbAll = s => idb(s, 'readonly', st => st.getAll());
+const idbKeys = s => idb(s, 'readonly', st => st.getAllKeys());
+const idbClear = s => idb(s, 'readwrite', st => st.clear());
+
+async function mirrorOpen(user) {
+  try {
+    if (!window.indexedDB) return;
+    await openDb(user); mirror.on = true;
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+  } catch (e) { mirror.on = false; }
+}
+
+function queueMedia(url) {
+  if (!mirror.on || !url || mirror.queued.has(url)) return;
+  mirror.queued.add(url); mirror.queue.push(url); pumpMedia();
+}
+function pumpMedia() {
+  while (mirror.active < 2 && mirror.queue.length) {
+    const url = mirror.queue.shift(); mirror.active++;
+    (async () => {
+      try {
+        if (mirror.on && (await idbGet('media', url)) === undefined) {
+          const r = await fetch(url, { credentials: 'same-origin' });
+          if (r.ok) { const blob = await r.blob(); await idbPut('media', { blob, type: blob.type }, url); }
+        }
+      } catch (e) { /* will retry next time */ }
+      mirror.active--; mirror.queued.delete(url); pumpMedia();
+    })();
+  }
+}
+async function localFallback(el, url) {
+  if (!mirror.on || el.dataset.fb) return;
+  el.dataset.fb = '1';
+  try { const rec = await idbGet('media', url); if (rec) el.src = URL.createObjectURL(rec.blob); } catch (e) { /* ignore */ }
+}
+
+function mirrorMsgs(list) {
+  if (!mirror.on || !list.length) return;
+  idb('messages', 'readwrite', s => { list.forEach(m => s.put(m)); }).catch(() => {});
+  list.forEach(m => (m.files || []).forEach(f => queueMedia(f.url)));
+}
+async function mirrorPatch(id, fields) {
+  if (!mirror.on) return;
+  try { const m = await idbGet('messages', id); if (m) await idbPut('messages', { ...m, ...fields }); } catch (e) { /* ignore */ }
+}
+function mirrorMems(list) {
+  if (!mirror.on || !list.length) return;
+  idb('memories', 'readwrite', s => { list.forEach(m => s.put(m)); }).catch(() => {});
+  list.forEach(m => queueMedia(m.image));
+}
+async function mirrorAvatars() {
+  if (!mirror.on) return;
+  try {
+    const cur = (await idbGet('meta', 'avatars')) || {};
+    Object.entries(state.avatars).forEach(([u, url]) => { if (url) cur[u] = url; });
+    await idbPut('meta', cur, 'avatars');
+    Object.values(cur).forEach(queueMedia);
+  } catch (e) { /* ignore */ }
+}
+async function mirrorHistory() {
+  if (!mirror.on || !state.messages.length) return;
+  let before = state.messages[0].id, guard = 0;
+  try {
+    while (before && guard++ < 300) {
+      const d = await api('/api/messages?before=' + before);
+      if (!d.messages.length) break;
+      const have = new Set(await idbKeys('messages'));
+      const fresh = d.messages.some(m => !have.has(m.id));
+      mirrorMsgs(d.messages);
+      if (!d.has_more || !fresh) break;
+      before = d.messages[0].id;
+    }
+  } catch (e) { /* ignore */ }
+}
+async function mirrorMemories() {
+  if (!mirror.on) return;
+  try {
+    const [{ memories }, ids] = await Promise.all([api('/api/memories'), api('/api/sync/ids')]);
+    for (const id of ids.tombstones) await idbDel('memories', id);
+    mirrorMems(memories);
+  } catch (e) { /* ignore */ }
+}
+async function pruneMedia() {
+  const keep = new Set((await idbAll('memories')).map(m => m.image));
+  Object.values((await idbGet('meta', 'avatars')) || {}).forEach(u => u && keep.add(u));
+  for (const k of await idbKeys('media')) if (!keep.has(k)) await idbDel('media', k);
+}
+async function localCleared(epoch) {
+  if (!mirror.on) return;
+  try { await idbClear('messages'); if (epoch) await idbPut('meta', epoch, 'epoch'); await pruneMedia(); } catch (e) { /* ignore */ }
+}
+
+async function syncStart() {
+  if (!mirror.on) return;
+  const st = await api('/api/sync/state');
+  const L = await idbGet('meta', 'epoch');
+  if (!st.epoch) {                       // server is new or was wiped
+    const r = await api('/api/sync/adopt', { method: 'POST', body: { epoch: L || randToken() } });
+    await idbPut('meta', r.epoch, 'epoch');
+  } else if (!L) {
+    await idbPut('meta', st.epoch, 'epoch');
+  } else if (L !== st.epoch) {           // chat was cleared while this phone was away
+    const del = confirm('Is chat ko kisi ne server par clear kar diya tha.\n\nOK = is phone ki purani copy bhi delete karo\nCancel = is phone ki copy se chat wapas bhar do');
+    if (del) await idbClear('messages');
+    await idbPut('meta', st.epoch, 'epoch');
+  }
+  await reconcile();
+  mirrorMemories();
+}
+
+async function reconcile() {
+  const srv = await api('/api/sync/ids');
+  const sMsg = new Set(srv.messages), sMem = new Set(srv.memories), files = new Set(srv.files);
+  for (const id of srv.tombstones) await idbDel('memories', id);
+  const msgs = await idbAll('messages'), mems = await idbAll('memories');
+  const upM = msgs.filter(m => !sMsg.has(m.id)), upP = mems.filter(m => !sMem.has(m.id));
+  if (upM.length && sMsg.size === 0) toast('Server khali mila. Is phone ki copy se chat wapas la rahe hain ♡');
+  for (const part of chunk(upM, 100)) await api('/api/sync/messages', { method: 'POST', body: { messages: part } });
+  for (const part of chunk(upP, 100)) await api('/api/sync/memories', { method: 'POST', body: { memories: part } });
+  uploadMissingFiles(msgs, mems, files).catch(() => {});
+}
+
+async function uploadMissingFiles(msgs, mems, have) {
+  const urls = new Set();
+  msgs.forEach(m => (m.files || []).forEach(f => urls.add(f.url)));
+  mems.forEach(m => urls.add(m.image));
+  const av = (await idbGet('meta', 'avatars')) || {};
+  Object.values(av).forEach(u => urls.add(u));
+  let sent = 0;
+  for (const url of urls) {
+    if (!url || have.has(fname(url))) continue;
+    const rec = await idbGet('media', url);
+    if (!rec) continue;
+    const fd = new FormData();
+    fd.append('file', new File([rec.blob], fname(url), { type: rec.type })); fd.append('name', fname(url));
+    try { await api('/api/sync/file', { method: 'POST', body: fd }); sent++; } catch (e) { /* skip */ }
+  }
+  if (Object.keys(av).length) {
+    await api('/api/sync/avatars', { method: 'POST', body: { avatars: av } }).catch(() => {});
+    try { const me = await api('/api/me'); state.avatars = me.avatars || state.avatars; refreshAvatars(); } catch (e) { /* ignore */ }
+  }
+  if (sent) { toast(`${sent} photo/video/voice server par wapas daal di ♡`); loadMessages(true); }
+}
+
+async function updateMirrorInfo() {
+  const el = $('#mirrorInfo');
+  if (!mirror.on) { el.textContent = 'Is browser mein local copy band hai (private mode?).'; return; }
+  try {
+    const n = (await idbKeys('messages')).length, k = (await idbKeys('media')).length;
+    let mb = '';
+    if (navigator.storage && navigator.storage.estimate) { const e = await navigator.storage.estimate(); mb = `, ~${Math.round((e.usage || 0) / 1048576)} MB`; }
+    el.textContent = `📱 Is phone mein saved: ${n} messages, ${k} photo/video/voice${mb}`;
+  } catch (e) { el.textContent = ''; }
+}
 
 // ------------------------------------------------------------------- boot
 (async function boot() {
